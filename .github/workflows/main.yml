@@ -15,18 +15,123 @@ jobs:
       - name: Récupérer le code
         uses: actions/checkout@v4
 
-      - name: Préparer le projet (ZIP ou sous-dossier)
+      - name: Préparer le projet
         run: |
           if [ ! -f package.json ]; then
             z=$(ls -1 *.zip 2>/dev/null | sort -V | tail -n1)
-            if [ -n "$z" ]; then
-              echo "ZIP trouvé : $z"
-              unzip -oq "$z" -d _projet
-              src=_projet
-            else
-              src=.
-            fi
-            p=$(find "$src" -maxdepth 4 -name package.json -not -path "*/node_modules/*" | head -n1)
-            if [ -z "$p" ]; then echo "ERREUR : aucun package.json trouvé dans le dépôt ni dans un ZIP."; exit 1; fi
-            d=$(dirname "$p")
-            echo "Projet trouvé dans : $d"
+            test -n "$z" || { echo "ERREUR : package.json introuvable. Envoie le CONTENU du zip (pas le zip lui-même) à la racine du dépôt."; exit 1; }
+            unzip -oq "$z" -d _projet
+            d=$(dirname "$(find _projet -maxdepth 4 -name package.json -not -path '*/node_modules/*' | head -n1)")
+            shopt -s dotglob
+            cp -r "$d"/* .
+          fi
+          test -f package.json
+          test -f www/index.html
+          echo "Projet prêt."
+
+      - name: Installer Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Installer Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Installer le SDK Android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Vérifier les fichiers du projet
+        run: |
+          manque=0
+          for f in www/index.html www/img/logo.png www/img/logo-192.png \
+            www/js/kanis-backend.js www/js/config.js scripts/patch-android.js \
+            resources/icon-foreground.png resources/icon-background.png \
+            capacitor.config.json package.json; do
+            if [ ! -f "$f" ]; then echo "MANQUE : $f"; manque=1; fi
+          done
+          grep -q 'signInWithPassword' www/js/kanis-backend.js || { echo "kanis-backend.js : ancienne version"; manque=1; }
+          grep -q "supabase.co" www/js/config.js || { echo "config.js : URL Supabase absente"; manque=1; }
+          if grep -rn "sb_secret_" www/; then echo "Clé secrète trouvée dans www/"; manque=1; fi
+          for f in resources/icon-only.png resources/splash.png resources/splash-dark.png; do
+            [ -f "$f" ] || echo "Avertissement : $f absent (écran de démarrage par défaut)"
+          done
+          exit $manque
+
+      - name: Installer les dépendances
+        run: npm install
+
+      - name: Copier supabase.js dans l'application (sans CDN)
+        run: |
+          npm run vendor
+          test -f www/js/vendor/supabase.js
+
+      - name: Créer le projet Android (Capacitor)
+        run: npx cap add android
+
+      - name: Ajouter le lien profond kanisvpn://auth-callback
+        run: |
+          node scripts/patch-android.js
+          grep -q 'android:scheme="kanisvpn"' android/app/src/main/AndroidManifest.xml
+
+      - name: Générer l'écran de démarrage depuis le logo
+        run: npx capacitor-assets generate --android --assetPath resources
+        continue-on-error: true
+
+      - name: Installer l'icône KANIS (logo officiel)
+        run: |
+          pip install pillow
+          python3 - <<'PY'
+          from PIL import Image, ImageDraw
+          import os
+          res = "android/app/src/main/res"
+          fg = Image.open("resources/icon-foreground.png").convert("RGBA")
+          bg = Image.new("RGBA", (1024, 1024), (2, 6, 18, 255))
+          comp = Image.alpha_composite(bg, fg)
+          sizes = {"mdpi": (48, 108), "hdpi": (72, 162), "xhdpi": (96, 216), "xxhdpi": (144, 324), "xxxhdpi": (192, 432)}
+          for k, (l, a) in sizes.items():
+              d = f"{res}/mipmap-{k}"
+              os.makedirs(d, exist_ok=True)
+              c = comp.resize((l * 4, l * 4), Image.LANCZOS)
+              m = Image.new("L", c.size, 0)
+              ImageDraw.Draw(m).rounded_rectangle([0, 0, c.size[0] - 1, c.size[1] - 1], radius=int(c.size[0] * .22), fill=255)
+              r = c.copy(); r.putalpha(m); r.resize((l, l), Image.LANCZOS).save(d + "/ic_launcher.png")
+              m2 = Image.new("L", c.size, 0)
+              ImageDraw.Draw(m2).ellipse([0, 0, c.size[0] - 1, c.size[1] - 1], fill=255)
+              r2 = c.copy(); r2.putalpha(m2); r2.resize((l, l), Image.LANCZOS).save(d + "/ic_launcher_round.png")
+              fg.resize((a, a), Image.LANCZOS).save(d + "/ic_launcher_foreground.png")
+          os.makedirs(res + "/mipmap-anydpi-v26", exist_ok=True)
+          os.makedirs(res + "/values", exist_ok=True)
+          xml = '<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n    <background android:drawable="@color/kanis_icon_bg"/>\n    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n</adaptive-icon>\n'
+          for n in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              open(res + "/mipmap-anydpi-v26/" + n, "w").write(xml)
+          open(res + "/values/kanis_icon.xml", "w").write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="kanis_icon_bg">#020612</color>\n</resources>\n')
+          print("Icône KANIS installée.")
+          PY
+          test -f android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png
+          grep -q 'android:icon="@mipmap/ic_launcher"' android/app/src/main/AndroidManifest.xml
+
+      - name: Synchroniser le site avec Android
+        run: npx cap sync android
+
+      - name: Compiler l'APK (debug)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Renommer l'APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk KANIS-VPN-ACADEMY.apk
+
+      - name: Publier l'APK dans les Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: KANIS-VPN-ACADEMY-APK
+          path: KANIS-VPN-ACADEMY.apk
+          if-no-files-found: error
+          retention-days: 30
+          
