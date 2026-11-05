@@ -1,0 +1,32 @@
+name: Build KANIS VPN ACADEMY APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Compiler l'APK Android
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Préparer le projet (ZIP ou sous-dossier)
+        run: |
+          if [ ! -f package.json ]; then
+            z=$(ls -1 *.zip 2>/dev/null | sort -V | tail -n1)
+            if [ -n "$z" ]; then
+              echo "ZIP trouvé : $z"
+              unzip -oq "$z" -d _projet
+              src=_projet
+            else
+              src=.
+            fi
+            p=$(find "$src" -maxdepth 4 -name package.json -not -path "*/node_modules/*" | head -n1)
+            if [ -z "$p" ]; then echo "ERREUR : aucun package.json trouvé dans le dépôt ni dans un ZIP."; exit 1; fi
+            d=$(dirname "$p")
+            echo "Projet trouvé dans : $d"
